@@ -1,56 +1,77 @@
+import asyncio
 import json
-import time
 from pathlib import Path
 
-import requests
+from judobase import JudoBase
 
-RAW_DIR = Path("data/raw")   # where the JSON files get saved
-DELAY_SECONDS = 2            # pause between requests, to be polite to the server
-MAX_ATTEMPTS = 3             # how many times to try before giving up
+RAW_DIR = Path("data/raw")
+DELAY_SECONDS = 1      # pause between athlete requests
+MAX_ATHLETES = 30      # sample size per competition for the feasibility check
 
-# Each item is: (file name to save as, URL to download)
-# Replace these with real Judobase URLs once you've found them.
-DOWNLOADS = [
-    ("test_one", "https://httpbin.org/json"),
-    ("test_two", "https://httpbin.org/get"),
-]
+# 994 = 2010 World Masters, 2653 = Paris 2024 Olympics
+# (assumes ijf.org competition IDs match the API's; verify in the output)
+COMPETITION_IDS = [994, 2653]
 
 
-def fetch_json(url):
-    """Download a URL and return the parsed JSON. Tries a few times if it fails."""
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            response = requests.get(
-                url,
-                headers={"User-Agent": "judo-portfolio-project (personal, non-commercial)"},
-                timeout=30,
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as error:
-            print(f"  Attempt {attempt} failed: {error}")
-            if attempt == MAX_ATTEMPTS:
-                raise
-            time.sleep(DELAY_SECONDS * attempt)
+def save_json(data, path):
+    """Write data to a JSON file, creating folders if needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
 
 
-def main():
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
+async def fetch_competition(api, competition_id):
+    comp_dir = RAW_DIR / f"competition_{competition_id}"
 
-    for name, url in DOWNLOADS:
-        path = RAW_DIR / f"{name}.json"
+    # 1. Competition info
+    info_path = comp_dir / "info.json"
+    if info_path.exists():
+        print(f"Skipping info for {competition_id} (already downloaded)")
+    else:
+        print(f"Fetching info for {competition_id}...")
+        competition = await api.competition_by_id(competition_id)
+        save_json(competition.model_dump(mode="json"), info_path)
 
-        if path.exists():
-            print(f"Skipping {name} (already downloaded)")
+    # 2. Contests (matches), including events
+    contests_path = comp_dir / "contests.json"
+    if contests_path.exists():
+        print(f"Skipping contests for {competition_id} (already downloaded)")
+    else:
+        print(f"Fetching contests for {competition_id}...")
+        contests = await api.contests_by_competition_id(
+            competition_id, include_events=True
+        )
+        save_json([c.model_dump(mode="json") for c in contests], contests_path)
+
+    # Always work from the saved file, whether we just wrote it or not
+    contests = json.loads(contests_path.read_text())
+    print(f"  {len(contests)} contests")
+
+    # 3. A sample of athlete profiles (for height, birth date)
+    athlete_ids = set()
+    for contest in contests:
+        athlete_ids.add(contest["id_person_blue"])
+        athlete_ids.add(contest["id_person_white"])
+
+    for athlete_id in sorted(athlete_ids)[:MAX_ATHLETES]:
+        athlete_path = comp_dir / "athletes" / f"{athlete_id}.json"
+        if athlete_path.exists():
             continue
 
-        print(f"Fetching {name}...")
-        data = fetch_json(url)
-        path.write_text(json.dumps(data, indent=2))
-        print(f"  Saved {path}")
+        try:
+            judoka = await api.judoka_by_id(athlete_id)
+        except Exception as error:
+            print(f"  Could not fetch athlete {athlete_id}: {error}")
+            continue
 
-        time.sleep(DELAY_SECONDS)
+        save_json(judoka.model_dump(mode="json"), athlete_path)
+        await asyncio.sleep(DELAY_SECONDS)
+
+
+async def main():
+    async with JudoBase() as api:
+        for competition_id in COMPETITION_IDS:
+            await fetch_competition(api, competition_id)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
